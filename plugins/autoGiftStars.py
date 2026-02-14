@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════════
 
 NAME = "StarsGifter"
-VERSION = "4.3"
+VERSION = "4.4"
 DESCRIPTION = "Автоматическая отправка звёзд через подарки Telegram"
 CREDITS = "@Scwee_xz"
 UUID = "298845c5-9c90-4912-b599-7ca26f94a7b1"
@@ -98,6 +98,11 @@ class StarsGifterPlugin:
         self._loop_thread = None  # Поток для event loop
         self.sent_orders: Dict[str, str] = {}  # order_id -> tg_username
         self.review_gifted_users: set = set()  # юзеры, уже получившие бонус за отзыв
+        
+        # Очередь заказов для последовательной обработки
+        self.order_queue = []
+        self.queue_lock = Thread()  # Для синхронизации доступа к очереди
+        self.processing_queue = False
 
     # ───────────────────── Конфиг ─────────────────────
 
@@ -144,6 +149,42 @@ class StarsGifterPlugin:
                 logger.info(f"{LOGGER_PREFIX} Лотов для деактивации не найдено в категориях {categories}")
         except Exception as e:
             logger.error(f"{LOGGER_PREFIX} Ошибка получения лотов для деактивации: {e}")
+
+    # ───────────────────── Очередь заказов ─────────────────────
+
+    def process_order_queue(self, cardinal: "Cardinal") -> None:
+        """Обрабатывает заказы из очереди последовательно с задержками."""
+        while True:
+            if not self.order_queue or not self.running:
+                time.sleep(1)
+                continue
+            
+            # Берём первый заказ из очереди
+            order_data = self.order_queue.pop(0)
+            
+            try:
+                username = order_data["username"]
+                total_stars = order_data["total_stars"]
+                chat_id = order_data["chat_id"]
+                order_id = order_data["order_id"]
+                amount = order_data["amount"]
+                stars_per_lot = order_data["stars_per_lot"]
+                
+                logger.info(
+                    f"{LOGGER_PREFIX} Обработка заказа #{order_id} из очереди "
+                    f"(осталось в очереди: {len(self.order_queue)})"
+                )
+                
+                # Обрабатываем заказ
+                self._send_order_gifts_with_refund(
+                    cardinal, username, total_stars, chat_id, order_id, amount, stars_per_lot
+                )
+                
+                # ЗАДЕРЖКА между заказами чтобы избежать флуд-лимита
+                time.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"{LOGGER_PREFIX} Ошибка обработки заказа из очереди: {e}")
 
 
     # ───────────────────── Pyrogram ─────────────────────
@@ -475,15 +516,14 @@ class StarsGifterPlugin:
                 return
 
             # УСПЕШНО ОТПРАВЛЕНО ВСЁ
-            report = f"✅ Отправлено: {stars_count} звёзд\n\n" + self.format_gifts_result(distribution)
-            cardinal.account.send_message(chat_id, report)
-
-            review_msg = (
-                "✅ Звезды отправлены на ваш аккаунт!\n\n"
-                "❤️ Подтвердите заказ и напишите отзыв."
-                f"\n✨ https://funpay.com/orders/{order_id}/"
+            # Одно компактное сообщение вместо трёх (чтобы избежать флуд-лимита)
+            success_msg = (
+                f"✅ Отправлено: {stars_count} звёзд\n\n"
+                + self.format_gifts_result(distribution) +
+                f"\n\n❤️ Подтвердите заказ и напишите отзыв:\n"
+                f"https://funpay.com/orders/{order_id}/"
             )
-            cardinal.account.send_message(chat_id, review_msg)
+            cardinal.account.send_message(chat_id, success_msg)
             logger.info(f"{LOGGER_PREFIX} Заказ #{order_id} успешно выполнен!")
             
             # Автоочистка чата
@@ -672,7 +712,7 @@ class StarsGifterPlugin:
     # ───────────────────── Хэндлеры событий ─────────────────────
 
     def handle_new_order(self, cardinal: "Cardinal", event: NewOrderEvent, *args) -> None:
-        """Обработка нового заказа — автоматическая отправка звёзд."""
+        """Обработка нового заказа — добавление в очередь для последовательной обработки."""
         if not self.running:
             return
 
@@ -708,6 +748,54 @@ class StarsGifterPlugin:
                 return
 
             total_stars = stars_per_lot * amount
+            
+            logger.info(
+                f"{LOGGER_PREFIX} Распознано: @{username}, {desc_stars} звёзд × {amount} шт = {total_stars} звёзд"
+            )
+
+            # Проверяем можно ли собрать такое количество подарков
+            gifts_distribution = self.calc_gifts_quantity(total_stars)
+            if not gifts_distribution:
+                cardinal.account.send_message(
+                    chat_id,
+                    f"❌ Невозможно собрать комбинацию для {total_stars} звёзд.\n"
+                    f"Пожалуйста, свяжитесь с продавцом."
+                )
+                logger.error(f"{LOGGER_PREFIX} Невозможно собрать {total_stars} звёзд из подарков")
+                return
+
+            # Сохраняем для бонуса за отзыв
+            self.sent_orders[order_id] = username
+
+            # ДОБАВЛЯЕМ В ОЧЕРЕДЬ вместо мгновенной отправки
+            order_data = {
+                "username": username,
+                "total_stars": total_stars,
+                "chat_id": chat_id,
+                "order_id": order_id,
+                "amount": amount,
+                "stars_per_lot": stars_per_lot,
+            }
+            
+            self.order_queue.append(order_data)
+            
+            queue_position = len(self.order_queue)
+            logger.info(
+                f"{LOGGER_PREFIX} Заказ #{order_id} добавлен в очередь (позиция: {queue_position})"
+            )
+            
+            # Отправляем ОДНО сообщение о принятии заказа
+            cardinal.account.send_message(
+                chat_id,
+                f"✅ Заказ принят!\n"
+                f"🚀 {total_stars} звёзд ({amount} × {stars_per_lot})\n"
+                f"📋 Позиция в очереди: {queue_position}\n\n"
+                f"Ожидайте отправки..."
+            )
+
+        except Exception as e:
+            logger.error(f"{LOGGER_PREFIX} Ошибка обработки заказа: {e}")
+            logger.debug(f"{LOGGER_PREFIX} TRACEBACK", exc_info=True)
             
             logger.info(
                 f"{LOGGER_PREFIX} Распознано: @{username}, {desc_stars} звёзд × {amount} шт = {total_stars} звёзд"
@@ -1070,6 +1158,16 @@ class StarsGifterPlugin:
             logger.info(f"{LOGGER_PREFIX} ✅ Pyrogram готов к работе")
         else:
             logger.warning(f"{LOGGER_PREFIX} ⚠️ Pyrogram не инициализирован (проверьте API настройки)")
+
+        # Запускаем процессор очереди заказов в фоне
+        queue_thread = Thread(
+            target=self.process_order_queue,
+            args=(cardinal,),
+            daemon=True,
+            name="StarsGifter-QueueProcessor"
+        )
+        queue_thread.start()
+        logger.info(f"{LOGGER_PREFIX} ✅ Процессор очереди заказов запущен")
 
         @cardinal.telegram.bot.message_handler(commands=["stars_panel"])
         def panel(m):
