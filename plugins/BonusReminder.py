@@ -30,11 +30,9 @@ class ReviewBonusPlugin:
     def __init__(self) -> None:
         self.running = True
         self.bonus_message = (
-            "🎁 Спасибо за отзыв!\n\n"
-            "💎 В качестве бонуса получите:\n"
-            "✨ Скидку 10% на следующую покупку\n"
-            "✨ Промокод: REVIEW10\n\n"
-            "Ждём вас снова! ❤️"
+            "🎁 Подарки\n\n"
+            "☀️АВТОВЫДАЧА☀️МАКСИМАЛЬНАЯ ОПТИМИЗАЦИЯ ПК https://docs.google.com/document/d/1FSk-Im4dH4GTk5M7tys3SSnH2yfAlCQ0s1nw1gU67iE/edit?tab=t.0\n\n"
+            "🌌🎯【500+ ПРЕМИАЛЬНЫХ СКРИПТОВ🌌】+【🌌5 ИНЖЕКТОРОВ🌌】+【🔥4 СКРИПТ-ХАБОВ🔥】ПК/ТЕЛ📱|⚡АВТО-ВЫДАЧА⚡https://docs.google.com/document/d/1iqb6ypUaqjFJwi7NOOcQp-jVkNLpnYErUeSiDoQlmq4/edit?usp=drivesdk"
         )
         self.send_once_per_user = True
         self.rewarded_users: Set[str] = set()

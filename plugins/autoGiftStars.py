@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════════
 
 NAME = "StarsGifter"
-VERSION = "4.2"
+VERSION = "4.3"
 DESCRIPTION = "Автоматическая отправка звёзд через подарки Telegram"
 CREDITS = "@Scwee_xz"
 UUID = "298845c5-9c90-4912-b599-7ca26f94a7b1"
@@ -117,6 +117,34 @@ class StarsGifterPlugin:
 
     def persist_config(self) -> None:
         self.save_config(self.config)
+
+    # ───────────────────── Деактивация лотов ─────────────────────
+
+    def deactivate_lots_in_categories(self, cardinal: "Cardinal", categories: list) -> None:
+        """Деактивирует все лоты в указанных категориях."""
+        try:
+            profile = cardinal.account.get_user(cardinal.account.id)
+            lots = profile.get_lots()
+            
+            deactivated_count = 0
+            for lot in lots:
+                if lot.subcategory.id in categories and lot.active:
+                    try:
+                        lot_fields = cardinal.account.get_lot_fields(lot.id)
+                        lot_fields.active = False
+                        cardinal.account.save_lot(lot_fields)
+                        logger.info(f"{LOGGER_PREFIX} 🔴 Деактивирован лот #{lot.id} (категория {lot.subcategory.id})")
+                        deactivated_count += 1
+                    except Exception as e:
+                        logger.error(f"{LOGGER_PREFIX} Ошибка деактивации лота #{lot.id}: {e}")
+            
+            if deactivated_count > 0:
+                logger.info(f"{LOGGER_PREFIX} Всего деактивировано лотов: {deactivated_count}")
+            else:
+                logger.info(f"{LOGGER_PREFIX} Лотов для деактивации не найдено в категориях {categories}")
+        except Exception as e:
+            logger.error(f"{LOGGER_PREFIX} Ошибка получения лотов для деактивации: {e}")
+
 
     # ───────────────────── Pyrogram ─────────────────────
 
@@ -205,8 +233,14 @@ class StarsGifterPlugin:
         Форматы: 
         - '... По username, @ReaLNey67, ...' (с @)
         - '... По username, maximtt66, ...' (без @)
+        - '... https://t.me/username ...' (t.me ссылка)
         """
-        # Сначала пробуем найти с @
+        # Сначала пробуем найти t.me ссылку
+        match = re.search(r'https?://t\.me/(\w{3,})', description, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        
+        # Потом пробуем найти с @
         match = re.search(r'@(\w{3,})', description)
         if match:
             return match.group(1)
@@ -356,6 +390,128 @@ class StarsGifterPlugin:
         except asyncio.TimeoutError:
             logger.error(f"{LOGGER_PREFIX} Таймаут выполнения корутины ({timeout}s)")
             raise
+
+    def _send_order_gifts_with_refund(
+        self,
+        cardinal: "Cardinal",
+        username: str,
+        stars_count: int,
+        chat_id,
+        order_id: str,
+        amount: int,
+        stars_per_lot: int,
+    ) -> None:
+        """Отправка подарков с проверкой баланса и автовозвратом."""
+        try:
+            if self.pyrogram_client is None:
+                cardinal.account.send_message(chat_id, "❌ Pyrogram клиент не подключен")
+                logger.error(f"{LOGGER_PREFIX} Pyrogram клиент = None")
+                return
+            
+            if self._loop is None or not self._loop.is_running():
+                cardinal.account.send_message(chat_id, "❌ Event loop не запущен")
+                logger.error(f"{LOGGER_PREFIX} Event loop не работает")
+                return
+
+            logger.info(f"{LOGGER_PREFIX} Начинаю отправку {stars_count}⭐ → @{username}")
+            
+            # Пытаемся отправить подарки
+            distribution, success, failed = self._run_on_pyrogram_loop(
+                self._send_gifts_async(username, stars_count)
+            )
+
+            if distribution is None:
+                cardinal.account.send_message(chat_id, "❌ Ошибка расчёта подарков")
+                return
+            if failed == -1:
+                cardinal.account.send_message(chat_id, f"❌ Пользователь @{username} не найден")
+                return
+            if failed == -2:
+                cardinal.account.send_message(chat_id, f"❌ Ошибка поиска @{username}")
+                return
+            if failed == -3:
+                cardinal.account.send_message(
+                    chat_id,
+                    "❌ Метод отправки подарков не доступен!\n"
+                    "Установите Pyrofork:\n"
+                    "pip uninstall pyrogram\n"
+                    "pip install pyrofork"
+                )
+                return
+
+            # Проверяем: отправлено ли всё
+            if failed > 0:
+                # НЕ ВСЁ ОТПРАВЛЕНО — ВОЗВРАТ СРЕДСТВ + ДЕАКТИВАЦИЯ
+                logger.error(
+                    f"{LOGGER_PREFIX} ❌ Не удалось отправить все подарки "
+                    f"({success} из {success + failed}), возврат средств"
+                )
+                
+                # Делаем возврат
+                try:
+                    cardinal.account.refund_order(order_id)
+                    logger.info(f"{LOGGER_PREFIX} 💰 Возврат средств по заказу #{order_id} выполнен")
+                    
+                    # Отправляем сообщение
+                    refund_msg = (
+                        f"❌ Извините, не хватает баланса звёзд!\n\n"
+                        f"Запрошено: {stars_count} звёзд ({amount} × {stars_per_lot})\n\n"
+                        f"💰 Средства возвращены на ваш счёт.\n"
+                        f"Приносим извинения за неудобства!"
+                    )
+                    cardinal.account.send_message(chat_id, refund_msg)
+                    
+                    # Деактивируем лоты в категориях 2418 и 3064
+                    self.deactivate_lots_in_categories(cardinal, [2418, 3064])
+                    
+                except Exception as refund_error:
+                    logger.error(f"{LOGGER_PREFIX} Ошибка возврата средств: {refund_error}")
+                    cardinal.account.send_message(
+                        chat_id,
+                        f"❌ Не удалось отправить подарки.\n"
+                        f"Пожалуйста, свяжитесь с продавцом для возврата средств."
+                    )
+                
+                return
+
+            # УСПЕШНО ОТПРАВЛЕНО ВСЁ
+            report = f"✅ Отправлено: {stars_count} звёзд\n\n" + self.format_gifts_result(distribution)
+            cardinal.account.send_message(chat_id, report)
+
+            review_msg = (
+                "✅ Звезды отправлены на ваш аккаунт!\n\n"
+                "❤️ Подтвердите заказ и напишите отзыв."
+                f"\n✨ https://funpay.com/orders/{order_id}/"
+            )
+            cardinal.account.send_message(chat_id, review_msg)
+            logger.info(f"{LOGGER_PREFIX} Заказ #{order_id} успешно выполнен!")
+            
+            # Автоочистка чата
+            if self.auto_clear_chat:
+                logger.info(
+                    f"{LOGGER_PREFIX} Запланирована очистка чата с @{username} "
+                    f"через {self.clear_chat_delay} секунд"
+                )
+                
+                def delayed_clear():
+                    time.sleep(self.clear_chat_delay)
+                    try:
+                        self._run_on_pyrogram_loop(
+                            self._clear_chat_history_async(username),
+                            timeout=30
+                        )
+                    except Exception as e:
+                        logger.error(f"{LOGGER_PREFIX} Ошибка отложенной очистки чата: {e}")
+                
+                Thread(target=delayed_clear, daemon=True, name=f"ClearChat-{username}").start()
+
+        except asyncio.TimeoutError:
+            cardinal.account.send_message(chat_id, "❌ Таймаут отправки подарков (>2 мин)")
+            logger.error(f"{LOGGER_PREFIX} Таймаут отправки звёзд @{username}")
+        except Exception as e:
+            cardinal.account.send_message(chat_id, f"❌ Ошибка отправки: {type(e).__name__}")
+            err_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            logger.error(f"{LOGGER_PREFIX} Ошибка отправки звёзд: {err_msg}")
 
     def _send_order_gifts(
         self,
@@ -534,26 +690,62 @@ class StarsGifterPlugin:
                 logger.info(f"{LOGGER_PREFIX} Username не найден в описании #{order_id}, пропуск")
                 return
 
-            # ФИКС БАГ 2: Извлекаем количество звёзд (теперь работает со всеми формами)
+            # Извлекаем количество звёзд (теперь работает со всеми формами)
             desc_stars = self._extract_stars_count(description)
             if not desc_stars:
                 logger.info(f"{LOGGER_PREFIX} Звёзды не найдены в описании #{order_id}, пропуск")
                 return
 
-            logger.info(f"{LOGGER_PREFIX} Распознано: @{username}, {desc_stars} звёзд из описания")
-
-            # Проверяем amount (только 1 лот за раз)
+            # Получаем количество заказанных лотов
             amount = order.amount if hasattr(order, "amount") and order.amount else 1
-            if amount != 1:
-                cardinal.account.send_message(
-                    chat_id,
-                    f"❌ Заказано {amount} лотов. Пожалуйста, заказывайте по одному!"
+            
+            # Рассчитываем общее количество звёзд
+            stars_per_lot = self._determine_stars_to_send(desc_stars)
+            if not stars_per_lot:
+                logger.warning(
+                    f"{LOGGER_PREFIX} Невозможно определить кол-во звёзд для {desc_stars} (заказ #{order_id})"
                 )
-                logger.warning(f"{LOGGER_PREFIX} Заказ #{order_id} — кол-во {amount}, пропуск")
                 return
 
-            # Определяем сколько звёзд отправить
-            stars_to_send = self._determine_stars_to_send(desc_stars)
+            total_stars = stars_per_lot * amount
+            
+            logger.info(
+                f"{LOGGER_PREFIX} Распознано: @{username}, {desc_stars} звёзд × {amount} шт = {total_stars} звёзд"
+            )
+
+            # Проверяем можно ли собрать такое количество подарков
+            gifts_distribution = self.calc_gifts_quantity(total_stars)
+            if not gifts_distribution:
+                cardinal.account.send_message(
+                    chat_id,
+                    f"❌ Невозможно собрать комбинацию для {total_stars} звёзд.\n"
+                    f"Пожалуйста, свяжитесь с продавцом."
+                )
+                logger.error(f"{LOGGER_PREFIX} Невозможно собрать {total_stars} звёзд из подарков")
+                return
+
+            # Сохраняем для бонуса за отзыв
+            self.sent_orders[order_id] = username
+
+            logger.info(
+                f"{LOGGER_PREFIX} Автоотправка {total_stars}⭐ → @{username} (заказ #{order_id}, {amount} шт)"
+            )
+            cardinal.account.send_message(
+                chat_id,
+                f"✨ Спасибо за заказ!\n"
+                f"🚀 Отправляю {total_stars} звёзд ({amount} × {stars_per_lot}) на @{username}..."
+            )
+
+            # Отправка в отдельном потоке чтобы не блокировать другие хэндлеры
+            Thread(
+                target=self._send_order_gifts_with_refund,
+                args=(cardinal, username, total_stars, chat_id, order_id, amount, stars_per_lot),
+                daemon=True,
+            ).start()
+
+        except Exception as e:
+            logger.error(f"{LOGGER_PREFIX} Ошибка обработки заказа: {e}")
+            logger.debug(f"{LOGGER_PREFIX} TRACEBACK", exc_info=True)
             if not stars_to_send:
                 logger.warning(
                     f"{LOGGER_PREFIX} Невозможно определить кол-во звёзд для {desc_stars} (заказ #{order_id})"
